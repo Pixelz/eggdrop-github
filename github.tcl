@@ -1000,6 +1000,7 @@ proc ::github::dccCommand {handle idx text} {
 			# FixMe: make output better?
 			foreach n [dict keys $settings] {
 				if {([llength $args] == 2) && (![string equal $name $n])} { continue }
+				if {[string equal $n "linker"]} { continue }
 				putdcc $idx "Settings for \"${n}\":"
 				putdcc $idx "Path: [dict get $settings $n path]"
 				putdcc $idx "Username: [dict get $settings $n username]"
