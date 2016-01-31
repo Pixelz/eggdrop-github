@@ -12,7 +12,7 @@ The majority of the settings for this script are available via the `.github` com
 - URL shortening via [git.io](https://git.io/)
 - Multiple repositories
 - Multiple channels
-- Links issues & pull request when typed in a channel like `#123`
+- Links issues & pull requests when typed in a channel like `#123`
 
 ## Prerequisites
 - [Eggdrop](http://www.eggheads.org/) 1.6.21 or above
