@@ -7,11 +7,12 @@ This script receives GitHub webhook events. It creates a partial HTTPd and waits
 The majority of the settings for this script are available via the `.github` command from the partyline.
 
 ## Features
-- Recieves events from github via built-in httpd
+- Recieves events from GitHub via built-in HTTPd
 - Supports many event types
 - URL shortening via [git.io](https://git.io/)
-- multipe repositories
-- multiple channels
+- Multiple repositories
+- Multiple channels
+- Links issues & pull request when typed in a channel like `#123`
 
 ## Prerequisites
 - [Eggdrop](http://www.eggheads.org/) 1.6.21 or newer
