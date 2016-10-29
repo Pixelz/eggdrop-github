@@ -21,9 +21,37 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
-# v0.1 by Pixelz (rutgren@gmail.com), January 31, 2016
+# v0.2 by Pixelz (rutgren@gmail.com), October 29, 2016
 #
+# Changes:
+# v0.2. October 29, 2016:
+#	- Added support for label event.
+#	- Added support for milestoned & demilestoned actions for issue event.
+#	- Added delayed output (10 seconds) for issue events. The script will now
+#	  fit all changes done to an issue in the same announcement.
+#	- Added support for status events.
+#	- Added a setting to enable (off by default) showing individual commits to
+#     a non-default branch.
+#	- Added number of bytes changed in an issue comment edit.
+#	- The script will now ignore push events for creating or deleting branches
+#	  or tags since there's another event that handles those.
+#	- More readable output for '.github list'
+#	- Fixed the issue linker not linking to issues with really low numbers.
+#	- Fixed issue comment event so that it doesn't always say "commented" even
+#     if the action was edited or closed.
+#	- Strip newlines from issue comments for more meaningful output.
+# 	- Fixed problem that caused commits not to show if the committer didn't
+#	  have an account on github.
+#	- Fixed a bug that caused multiple repositories to not work properly.
+#	- Fixed a bug that caused events to be sent to all channels that had that
+#	  event configured.
+#	
+# v0.1. January 31, 2016:
+#	- Initial release.
 #
+# ToDo:
+#	- Write settings to temp file & move
+
 
 # some of these might be able to go lower, these are what the script was tested on
 package require Tcl 8.6 ;# 8.6 needed
@@ -31,7 +59,7 @@ package require eggdrop 1.6.21
 package require http 2.8.8
 package require tls 1.6.4
 package require json 1.3.3 ;# I think 1.3.3 is needed
-package require sha1 2.0.3 
+package require sha1 2.0.3
 package require base64 2.4.2
 
 namespace eval ::github {
@@ -53,6 +81,18 @@ namespace eval ::github {
 
 	# Shorten URLs using git.io?
 	set shortenUrls 1
+
+	# Show "pending" status events. These are events showing the status of a
+	# commit. They are sent via github's API from a 3rd party, for example
+	# Jenkins, etc. Pending means that the commit has been queued for building
+	# or similar. There will be other events sent after the pending one(s) that
+	# are generally more interesting.
+	set showPendingStatus 0
+	
+	# Show individual commits pushed to a non-default branch. This will
+	# potentially result in walls of text whenever a branch is synchronized
+	# with the default branch.
+	set showNonDefaultCommits 0
 
 
 	### More settings, you probably don't need to change these:
@@ -76,11 +116,30 @@ namespace eval ::github {
 
 	### End of settings
 
-	set validEvents [list commit_comment create delete fork gollum issue_comment issues\
-					member pull_request pull_request_review_comment push release watch]
+
+	# load local settings if they exist
+	if {[file exists scripts/github.tcl.local] && [file readable scripts/github.tcl.local]} {
+		source scripts/github.tcl.local
+		putlog "Loaded local settings from github.tcl.local"
+	}
+	
+	# ToDo: add support:
+	# deployment
+	# deployment_status
+	# membership (organization hooks only)
+	# milestone
+	# page_build
+	# public
+	# pull_request_review
+	# repository
+	# team_add
+	
+	set validEvents [list commit_comment create delete fork gollum issue_comment issues label\
+					member pull_request pull_request_review_comment push release status watch]
 
 	variable state
 	variable settings
+	variable delayedSendIds
 }
 
 # rfc1459 channel name comparison
@@ -97,7 +156,7 @@ proc ::github::gitio {url} {
 	set token [::http::geturl https://git.io -query [::http::formatQuery url $url]]
 	upvar #0 $token state
 	array set meta $state(meta)
-	::http::cleanup $token
+	catch { ::http::cleanup $token }
 	if {[string equal "201 Created" $meta(Status)] && [string match "https://git.io/*" $meta(Location)] && [string length $meta(Location)] > 15} {
 		return $meta(Location)
 	} else {
@@ -124,7 +183,7 @@ proc ::github::issueLinker {nick uhost hand chan text} {
 	putloglev d * "found repo for $chan: $repo"
 	
 	# extract IDs from the text
-	foreach {- a b} [regexp -all -nocase -inline "(?:\#(\[0-9\]{2,})|https?://github.com${repo}/(?:issues|pull)/(\[0-9\]{2,}))" $text] {
+	foreach {- a b} [regexp -all -nocase -inline "(?:\#(\[0-9\]+)|https?://github.com${repo}/(?:issues|pull)/(\[0-9\]+))" $text] {
 		if {![string equal "" $a]} {
 			lappend ids $a
 		} elseif {![string equal "" $b]} {
@@ -155,7 +214,7 @@ proc ::github::issueLinker {nick uhost hand chan text} {
 		if {[info exists state(error)]} { set error $state(error) }
 		array set meta $state(meta)
 		set body [encoding convertfrom utf-8 $state(body)]
-		::http::cleanup $token
+		catch { ::http::cleanup $token }
 		
 		switch -exact -- $status {
 			reset {
@@ -200,12 +259,12 @@ proc ::github::plural {word count} {
 	}
 }
 
-proc ::github::shortenBody {string {length 128}} {
+proc ::github::shortenBody {string {length 64}} {
 	set string [string map [list \r ""] $string]
 	set firstLine [lindex [split $string \n] 0]
-	set retval [string range $firstLine 0 128]
+	set retval [string range $firstLine 0 $length]
 	if {[string length $firstLine] > $length || [llength [split $string \n]] > 1} {
-		set retval "${retval}..."
+		set retval "[string trim [string range $retval 0 ${length}-3]]..."
 	}
 	return $retval
 }
@@ -213,14 +272,41 @@ proc ::github::shortenBody {string {length 128}} {
 proc ::github::formatRef {ref} {
 	# refs/heads/master
 	# refs/heads/bug/encodings
-	if {[regexp -- {^refs/heads/(.+)$} $ref - branch]} {
+	# refs/tags/v1.8.0rc1
+	if {[regexp -- {^refs/(?:heads|tags)/(.+)$} $ref - branch]} {
 		return "/$branch"
 	} else {
 		return
 	}
 }
 
+# this is unused at the moment
+proc ::github::getRefType {ref} {
+	# this is a branch: refs/heads/release/1.8.0
+	# this is a tag: refs/tags/v1.8.0rc1
+	if {[regexp -- {^refs/(head|tag)s/.+$} $ref - type]} {
+		if {[string equal $type "head"]} { set type "branch" }
+		return $type
+	} else {
+		return
+	}
+}
+
+# by BEO http://wiki.tcl.tk/10874
+proc ::github::format_1024_units {value} {
+	set len [string length $value]
+	if {$value < 1024} {
+		format "%s [plural "byte" $value]" $value
+	} else {
+		set unit [expr {($len - 1) / 3}]
+		format "%.1f %s" [expr {$value / pow(1024,$unit)}] [lindex [list B KiB MiB GiB TiB PiB EiB ZiB YiB] $unit]
+	}
+}
+
 proc ::github::parseJson {event json} {
+	variable showPendingStatus
+	variable showNonDefaultCommits
+	upvar 1 delayedSend delayedSend
 	set jdict [::json::json2dict $json]
 	putloglev d * "github.tcl: parseJson event: $event"
 	switch -- $event {
@@ -272,35 +358,92 @@ proc ::github::parseJson {event json} {
 		}
 		issue_comment {
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
-			append msg "commented on issue \#[dict get $jdict issue number]: "
-			append msg "[shortenBody [dict get $jdict comment body]] "
+			set bytes ""
+			switch -- [dict get $jdict action] {
+				created {
+					set action "commented on"
+				}
+				edited {
+					set oldLen [string bytelength [dict get $jdict changes body from]]
+					set newLen [string bytelength [dict get $jdict comment body]]
+					if {$oldLen > $newLen} {
+						set bytes " ([format_1024_units [expr $oldLen - $newLen]] removed)"
+					} elseif {$newLen > $oldLen} {
+						set bytes " ([format_1024_units [expr $newLen - $oldLen]] added)"
+					}
+					set action "edited comment on"
+				}
+				deleted {
+					set action "deleted comment on"
+				}
+				default {
+					# this should not happen unless the API changes
+					set action [dict get $jdict action]
+				}
+			}
+			append msg "$action issue \#[dict get $jdict issue number]${bytes}: "
+			# strip newlines for more meaningful output
+			append msg "[shortenBody [join [regexp -all -inline {\S+} [dict get $jdict comment body]]]] "
 			append msg "[gitio [dict get $jdict issue html_url]]"
 			return [list $msg]
 		}
 		issues {
-			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
-			append msg "[dict get $jdict action] issue "
-			append msg "\#[dict get $jdict issue number] "
-			append msg "([dict get $jdict issue title])"
-			switch -- [dict get $jdict action] {
-				assigned {
-					append msg " to [dict get $jdict assignee login] "
-				}
+			set action [dict get $jdict action]
+
+			set repName [dict get $jdict repository name]
+			set issueNum [dict get $jdict issue number]
+			set senderLogin [dict get $jdict sender login]
+			set issueTitle [dict get $jdict issue title]
+			set url [dict get $jdict issue html_url]
+			set delayedSend 1
+			switch -- $action {
+				assigned -
 				unassigned {
-					append msg " from [dict get $jdict assignee login] "
+					return [list $repName $issueNum $action $senderLogin $issueTitle $url [dict get $jdict assignee login]]
 				}
 				labeled -
 				unlabeled {
-					append msg " with \"[dict get $jdict label name]\" "
+					return [list $repName $issueNum $action $senderLogin $issueTitle $url [dict get $jdict label name]]
+				}
+				milestoned {
+					return [list $repName $issueNum $action $senderLogin $issueTitle $url [dict get $jdict issue milestone title]]
 				}
 				opened -
 				closed -
 				reopened -
+				demilestoned {
+					return [list $repName $issueNum $action $senderLogin $issueTitle $url]
+				}
 				default {
-					append msg " "
+					# this should not happen unless new actions are added to the API
+					set msg "\[${repName}\] $senderLogin $action issue #${issueNum} (${issueTitle}) [gitio $url]"
+					set delayedSend 0
 				}
 			}
-			append msg "[gitio [dict get $jdict issue html_url]]"
+			return [list $msg]
+		}
+		label {
+			set action [dict get $jdict action]
+			set repName [dict get $jdict repository name]
+			set senderLogin [dict get $jdict sender login]
+			set labelName [dict get $jdict label name]
+			set url [gitio [dict get $jdict repository html_url]]
+
+			if {[string equal $action "edited"]} {
+				if {[dict exists $jdict changes name from]} {
+					# name was changed
+					set msg "\[${repName}\] $senderLogin renamed label \"[dict exists $jdict changes name from]\" to \"${labelName}\" $url"
+				} elseif {[dict exists $jdict changes color from]} {
+					# color was changed
+					set msg "\[${repName}\] $senderLogin changed the color of label \"${labelName}\" $url"
+				}  else {
+					# something else was changed that's not currently in the API
+					set msg "\[${repName}\] $senderLogin $action label \"${labelName}\" $url"
+				}
+			} else {
+				# created, deleted
+				set msg "\[${repName}\] $senderLogin $action label \"${labelName}\" $url"
+			}
 			return [list $msg]
 		}
 		member {
@@ -345,18 +488,45 @@ proc ::github::parseJson {event json} {
 		}
 		push {
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict pusher name] "
-			append msg "pushed [llength [dict get $jdict commits]] "
-			append msg "[plural "commit" [llength [dict get $jdict commits]]] "
-			append msg "to [dict get $jdict repository name][formatRef [dict get $jdict ref]]: "
-			append msg "[gitio [dict get $jdict compare]]"
-			lappend retval $msg
-			
-			foreach commit [dict get $jdict commits] {
-				set msg "[dict get $jdict repository name][formatRef [dict get $jdict ref]] "
-				append msg "[string range [dict get $commit id] 0 6] "
-				append msg "[dict get $commit author username]: "
-				append msg "[shortenBody [dict get $commit message]]"
+			if {[string equal [dict get $jdict created] "true"]} {
+				# this is a created branch or tag
+				putloglev d * "github.tcl: got a push event for a created branch or tag - ignoring"
+				return
+				#append msg "created [getRefType [dict get $jdict ref]] [dict get $jdict repository name][formatRef [dict get $jdict ref]]"
+				#lappend retval $msg
+			} elseif {[string equal [dict get $jdict deleted] "true"]} {
+				# this is a deleted branch or tag
+				 putloglev d * "github.tcl: got a push event for a deleted branch or tag - ignoring"
+				return
+				#append msg "deleted [getRefType [dict get $jdict ref]] [dict get $jdict repository name][formatRef [dict get $jdict ref]]"
+				#lappend retval $msg
+			} else {
+				# this is a normal push
+				if {[llength [dict get $jdict commits]] == 0} {
+					# no commits were pushed
+					putloglev d * "github.tcl: got a push event with 0 commits - ignoring"
+					return
+				}
+				append msg "pushed [llength [dict get $jdict commits]] "
+				append msg "[plural "commit" [llength [dict get $jdict commits]]] "
+				append msg "to [dict get $jdict repository name][formatRef [dict get $jdict ref]]: "
+				append msg "[gitio [dict get $jdict compare]]"
 				lappend retval $msg
+				
+				# only show individual commits if they're pushed to the default branch, unless setting enabled
+				if {[string equal [dict get $jdict repository default_branch] [string trimleft [formatRef [dict get $jdict ref]] "/"]] || $showNonDefaultCommits == 1} {
+					foreach commit [dict get $jdict commits] {
+						set msg "[dict get $jdict repository name][formatRef [dict get $jdict ref]] "
+						append msg "[string range [dict get $commit id] 0 6] "
+						if {[dict exists $commit author username]} {
+							append msg "[dict get $commit author username]: "
+						} else {
+							append msg "[dict get $commit author name]: "
+						}
+						append msg "[shortenBody [dict get $commit message]]"
+						lappend retval $msg
+					}
+				}
 			}
 			return $retval
 		}
@@ -381,6 +551,43 @@ proc ::github::parseJson {event json} {
 			append msg "[gitio [dict get $jdict release html_url]]"
 			return [list $msg]
 		}
+		status {
+			# The status of a commit changed, these are triggered via the API from jenkins, etc
+			# The new state. Can be pending, success, failure, or error.
+			if {$showPendingStatus != 1 && [string equal [dict get $jdict state] "pending"]} {
+				putloglev d * "github.tcl: got \"pending\" status event, ignoring"
+				return
+			}			
+			
+			set msg "\[[dict get $jdict repository name]\] [string range [dict get $jdict sha] 0 6] "
+		
+			if {[dict exists $jdict commit author login]} {
+				append msg "[dict get $jdict commit author login]"
+			} elseif {[dict exists $jdict commit commit author name]} {
+				append msg "[dict get $jdict commit commit author name]"
+			} else {
+				append msg "[dict get $jdict sender login]"
+			}
+			
+			if {[dict exists $jdict commit commit message] && ![string equal [dict get $jdict commit commit message] "null"]} {
+				append msg " ([shortenBody [dict get $jdict commit commit message]])"
+			}
+			
+			append msg ". Status: [string toupper [dict get $jdict state]]"
+			
+			if {![string equal [dict get $jdict description] "null"]} {
+				append msg ": [shortenBody [string trim [dict get $jdict description]]]"
+			}
+			
+			if {[dict exists $jdict target_url] && ![string equal [dict get $jdict target_url] "null"]} {
+				append msg ". [dict get $jdict target_url]"
+			} elseif {[dict exists $jdict commit commit url]} {
+				append msg ". [gitio [dict get $jdict commit commit url]]"
+			} else {
+				append msg "."
+			}
+			return [list $msg]
+		}
 		watch {
 			# when someone STARS a repository (not watches it)
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
@@ -395,11 +602,190 @@ proc ::github::parseJson {event json} {
 	return
 }
 
-proc ::github::processData {event data {directChan ""}} {
-	variable settings
-	variable privmsgTargMax 
+# further processing of some events that belong together but gets sent separately by github
+# FixMe: this could probably grow into a too long line if a lot of different stuff was done to an issue at the same time
+proc ::github::delayedSend {event path directChan id len} {
+	variable delayedSendIds
+	putloglev d * "github.tcl: enter delayedSend: $event <> $path <> $directChan <> $id <> $len"
+	putloglev d * "[lindex $delayedSendIds($id) 0] != $len"
+	if {[info exists delayedSendIds($id)] && [lindex $delayedSendIds($id) 0] != $len} {
+		# there's more coming
+		putloglev d * "github.tcl: more coming, returning"
+		return
+	} else {
+		putloglev d * "github.tcl: delayedSend started parsing for id: $id"
+		switch -- $event {
+			issues {
+				# output == $repName $issueNum $action $senderLogin $issueTitle $url [action-specific]
+				foreach output [lrange $delayedSendIds($id) 1 end] {
+					lassign $output repName issueNum action senderLogin issueTitle url -
+					switch -- $action {
+						assigned {
+							lappend actionAssigned [lindex $output end]
+						}
+						unassigned {
+							lappend actionUnassigned [lindex $output end]
+						}
+						labeled {
+							lappend actionLabeled [lindex $output end]
+						}
+						unlabeled {
+							lappend actionUnlabeled [lindex $output end]
+						}
+						milestoned {
+							lappend actionMilestoned [lindex $output end]
+						}
+						demilestoned {
+							lappend actionDemilestoned [lindex $output end]
+						}
+						opened {
+							lappend mainAction "opened"
+						}
+						closed {
+							lappend mainAction "closed"
+						}
+						reopened {
+							lappend mainAction "reopened"
+						}
+					}
+				}
+				if {[info exists mainAction] && [llength $mainAction] > 1} {
+					set mainAction [join $mainAction ", "]
+				}
+				if {![info exists mainAction]} {
+					if {[info exists actionAssigned]} {
+						set mainAction "assigned"
+					} elseif {[info exists actionUnassigned]} {
+						set mainAction "unassigned"
+					} elseif {[info exists actionLabeled]} {
+						set mainAction "labeled"
+					} elseif {[info exists actionUnlabeled]} {
+						set mainAction "unlabeled"
+					} elseif {[info exists actionMilestoned]} {
+						set mainAction "milestoned"
+					} elseif {[info exists actionDemilestoned]} {
+						set mainAction "demilestoned"
+					} else {
+						# this should never happen
+						set mainAction ""
+					}
+				}
+				
+				set extraActions ""
+				# assigned
+				if {[info exists actionAssigned]} {
+					if {![string equal $mainAction "assigned"]} {
+						append extraActions " and assigned it"
+					}
+					append extraActions " to [join $actionAssigned ", "]"
+				}
+				# unassigned
+				if {[info exists actionUnassigned]} {
+					if {![string equal $mainAction "unassigned"]} {
+						if {[info exists actionAssigned]} {
+							append extraActions ", unassigned it"
+						} else {
+							append extraActions " and unassigned it"
+						}
+					}
+					append extraActions " from [join $actionUnassigned ", "]"
+				}
+				# labeled
+				if {[info exists actionLabeled]} {
+					if {![string equal $mainAction "labeled"]} {
+						if {[info exists actionAssigned] || [info exists actionUnassigned]} {
+							append extraActions ", labeled it"
+						} else {
+							append extraActions " and labeled it"
+						}
+					}
+					append extraActions " with [join $actionLabeled ", "]"
+				}
+				# unlabeled
+				if {[info exists actionUnlabeled]} {
+					if {![string equal $mainAction "unlabeled"]} {
+						if {[info exists actionAssigned] || [info exists actionUnassigned] || [info exists actionLabeled]} {
+							append extraActions ", unlabeled it"
+						} else {
+							append extraActions " and unlabeled it"
+						}
+					}
+					append extraActions " with [join $actionUnlabeled ", "]"
+				}
+				# milestoned
+				if {[info exists actionMilestoned]} {
+					if {![string equal $mainAction "milestoned"]} {
+						if {[info exists actionAssigned] || [info exists actionUnassigned] || [info exists actionLabeled] || [info exists actionUnlabeled]} {
+							append extraActions ", milestoned it"
+						} else {
+							append extraActions " and milestoned it"
+						}
+					}
+					append extraActions " with [join $actionMilestoned ", "]"
+				}
+				# demilestoned
+				if {[info exists actionDemilestoned]} {
+					if {![string equal $mainAction "demilestoned"]} {
+						if {[info exists actionAssigned] || [info exists actionUnassigned] || [info exists actionLabeled] || [info exists actionUnlabeled] || [info exists actionMilestoned]} {
+							append extraActions ", demilestoned it"
+						} else {
+							append extraActions " and demilestoned it"
+						}
+					}
+				}
+				set msg "\[${repName}\] $senderLogin $mainAction issue #${issueNum} (${issueTitle})${extraActions} [gitio $url]"
+				putloglev d * "github.tcl: msg: $msg"
+				outputMsg $event $path [list $msg] $directChan
+				unset delayedSendIds($id)
+				return
+			}
+			default {
+				putlog "github.tcl error: delayedSend for unhandled event: $event"
+				return
+			}
+		}
+	}
+}
+
+# main parsing proc that gets called after a new payload is received
+proc ::github::processData {event path data {directChan ""}} {
+	variable delayedSendIds
 	
+	set delayedSend 0; # this is upvar'd from parseJson
 	set output [parseJson $event $data]
+	
+	if {$delayedSend} {
+		switch -- $event {
+			issues {
+				# output == $repName $issueNum $action $senderLogin $issueTitle $url [action-specific]
+				lassign $output repName issueNum -
+				set id "$repName,$issueNum"
+			}
+			default {
+				putlog "github.tcl error: processData for unhandled event: $event"
+				return
+			}
+		}
+
+		if {![info exists delayedSendIds($id)]} {
+			set delayedSendIds($id) 0
+		}
+		lappend delayedSendIds($id) $output
+		set delayedSendIds($id) [lreplace $delayedSendIds($id) 0 0 [llength $delayedSendIds($id)]]
+		putloglev d * "github.tcl: calling utimer with $event <> $path <> $directChan <> $id <> [llength $delayedSendIds($id)]"
+		# FixMe: I don't like this, if there's any error in the proc then delayedSendIds will grow forever. Maybe add some short proc
+		# in between that's responsible for calling delayedSend and unsetting delayedSendIds
+		utimer 10 [list ::github::delayedSend $event $path $directChan $id [llength $delayedSendIds($id)]]
+		return
+	}
+	outputMsg $event $path $output $directChan
+	return
+}
+
+# output to IRC
+proc ::github::outputMsg {event path output {directChan ""}} {
+	variable settings
+	variable privmsgTargMax
 	
 	if {![string equal $output ""]} {
 		if {![string equal $directChan ""]} {
@@ -410,12 +796,14 @@ proc ::github::processData {event data {directChan ""}} {
 		}
 		
 		# find channels to output to and stick them in $targets
-		foreach c [channels] {
-			foreach name [dict keys $settings] {
-				if {[dict exists $settings $name channels $c]} {
-					foreach {setChan setEvents} [dict get $settings $name channels] {
-						if {([ircstreql $c $setChan]) && ([lsearch -exact $setEvents $event] != -1)} {
-							lappend targets $c
+		foreach name [dict keys $settings] {
+			if {[dict exists $settings $name path] && [string equal [dict get $settings $name path] $path]} {
+				foreach c [channels] {
+					if {[dict exists $settings $name channels $c]} {
+						foreach {setChan setEvents} [dict get $settings $name channels] {
+							if {([ircstreql $c $setChan]) && ([lsearch -exact $setEvents $event] != -1)} {
+								lappend targets $c
+							}
 						}
 					}
 				}
@@ -434,6 +822,8 @@ proc ::github::processData {event data {directChan ""}} {
 						putserv "PRIVMSG [join $outChans ","] :$line"
 					}
 				}
+			} else {
+				putloglev d * "github.tcl processed \"${event}\" event but found no channels to output to: $line"
 			}
 		}
 	}
@@ -505,7 +895,7 @@ proc ::github::httpHeader {sock} {
 		if {[regexp -- {^(POST) ([^?]+)\??([^ ]*) HTTP/1.(0|1)$} $line - method path query]} {
 
 			foreach name [dict keys $settings] {
-				if {[string equal [dict get $settings $name path] $path]} {
+				if {![string equal $name "linker"] && [string equal [dict get $settings $name path] $path]} {
 					dict set state $sock name $name
 					dict set state $sock method $method
 					dict set state $sock path $path
@@ -612,6 +1002,7 @@ proc ::github::httpQuery {sock} {
 		set github(event) [dict get $state $sock mime x-github-event]
 		set github(delivery) [dict get $state $sock mime x-github-delivery]
 		set github(signature) [dict get $state $sock mime x-hub-signature]
+		set github(path) [dict get $state $sock path]
 		set sharedSecret [dict get $settings [dict get $state $sock name] secret]
 	
 		# send the response and remove the state array
@@ -628,6 +1019,7 @@ proc ::github::httpQuery {sock} {
 			putloglev d * "Saving JSON payload to scripts/jsonStore"
 			set fd [open scripts/jsonStore a+]
 			chan configure $fd -translation binary
+			chan puts $fd "time: [clock format [clock seconds]]"
 			chan puts $fd "event: $github(event)"
 			chan puts $fd "delivery: $github(delivery)"
 			chan puts $fd "signature: $github(signature)"
@@ -636,7 +1028,7 @@ proc ::github::httpQuery {sock} {
 		}
 
 		if {([string equal "sha1=[::sha1::hmac -hex -key $sharedSecret [encoding convertto utf-8 $data]]" $github(signature)]) && (![string equal $github(event) ""])} {
-			processData $github(event) $data
+			processData $github(event) $github(path) $data
 		}
 	}
 	return
@@ -784,7 +1176,7 @@ proc ::github::dccCommand {handle idx text} {
 	#
 	# .github set <name> <username/password/secret/path/channel> <value> [value...]
 	#
-	# .github info [name]
+	# .github info [name/linker]
 	#
 	# .github
 	# .github help
@@ -987,7 +1379,7 @@ proc ::github::dccCommand {handle idx text} {
 		}
 		list -
 		info {
-			# .github info [name]
+			# .github info [name/linker]
 			lassign $args - name
 			set name [string tolower $name]
 			if {[llength $args] > 2} {
@@ -997,38 +1389,41 @@ proc ::github::dccCommand {handle idx text} {
 				putdcc $idx "Error: no such name \"${name}\""
 				return
 			}
-			# FixMe: make output better?
 			foreach n [dict keys $settings] {
 				if {([llength $args] == 2) && (![string equal $name $n])} { continue }
 				if {[string equal $n "linker"]} { continue }
 				putdcc $idx "Settings for \"${n}\":"
-				putdcc $idx "Path: [dict get $settings $n path]"
-				putdcc $idx "Username: [dict get $settings $n username]"
-				putdcc $idx "Password: [dict get $settings $n password]"
-				putdcc $idx "GitHub secret: [dict get $settings $n secret]"
+				putdcc $idx "  Path: [dict get $settings $n path]"
+				putdcc $idx "  Username: [dict get $settings $n username]"
+				putdcc $idx "  Password: [dict get $settings $n password]"
+				putdcc $idx "  GitHub secret: [dict get $settings $n secret]"
 				
-				set msg "GitHub webhook URL: http://"
+				set msg "  GitHub webhook URL: http://"
 				append msg "[dict get $settings $n username]:"
 				append msg "[dict get $settings $n password]"
 				append msg "@your.ip.or.hostname:${port}"
 				append msg "[dict get $settings $n path]"
 				putdcc $idx $msg
 
-				putdcc $idx "Configured channels:"
+				putdcc $idx "  Configured channels:"
 				foreach {chan events} [dict get $settings $n channels] {
 					set disabledEvents [lmap x $validEvents { expr {[lsearch -exact $events $x] == -1 ? $x : [continue] } }]
-					putdcc $idx "Channel: $chan"
+					putdcc $idx "    Channel: $chan"
 					if {[string equal $disabledEvents ""]} {
-						putdcc $idx "Enabled events: [join $events]"
-						putdcc $idx "No disabled events."
+						putdcc $idx "      Enabled events: [join $events]"
+						putdcc $idx "      No disabled events."
 					} elseif {[string equal $events ""]} {
-						putdcc $idx "No enabled events."
-						putdcc $idx "Disabled events: [join $disabledEvents]"
+						putdcc $idx "      No enabled events."
+						putdcc $idx "      Disabled events: [join $disabledEvents]"
 					} else {
-						putdcc $idx "Enabled events: [join $events]"
-						putdcc $idx "Disabled events: [join $disabledEvents]"
+						putdcc $idx "      Enabled events: [join $events]"
+						putdcc $idx "      Disabled events: [join $disabledEvents]"
 					}
 				}
+			}
+			putdcc $idx "Linker settings:"
+			foreach {chan path} [dict get $settings linker] {
+				putdcc $idx "  $chan: $path"
 			}
 			return 1
 		}
@@ -1082,7 +1477,7 @@ proc ::github::dccCommand {handle idx text} {
 			putdcc $idx {.github rename <old name> <new name>}
 			putdcc $idx {.github set <name> <path/username/password/secret/channel> <value> [value ...]}
 			putdcc $idx {.github unset <name> channel <channel>}
-			putdcc $idx {.github list [name]}
+			putdcc $idx {.github list [name/linker]}
 			putdcc $idx {.github linker set <channel> <repository>}
 			putdcc $idx {.github linker unset <channel>}
 			putdcc $idx {.github help}
@@ -1109,5 +1504,5 @@ namespace eval ::github {
 
 	loadSettings
 	
-	putlog "Loaded github.tcl v0.1 by Pixelz"
+	putlog "Loaded github.tcl v0.2 by Pixelz"
 }
