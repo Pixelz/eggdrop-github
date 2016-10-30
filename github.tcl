@@ -21,9 +21,15 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
-# v0.2 by Pixelz (rutgren@gmail.com), October 29, 2016
+# v0.3 by Pixelz (rutgren@gmail.com), October 30, 2016
 #
 # Changes:
+# v0.3. October 30, 2016:
+#	- Added support for pull_request_review event.
+#	- Added rudimentary support for milestone event.
+#	- Fixed pull request comments being reported as issue comments.
+#	- Fixed a bug with renamed labels being reported incorrectly.
+#
 # v0.2. October 29, 2016:
 #	- Added support for label event.
 #	- Added support for milestoned & demilestoned actions for issue event.
@@ -31,14 +37,14 @@
 #	  fit all changes done to an issue in the same announcement.
 #	- Added support for status events.
 #	- Added a setting to enable (off by default) showing individual commits to
-#     a non-default branch.
+#	  a non-default branch.
 #	- Added number of bytes changed in an issue comment edit.
 #	- The script will now ignore push events for creating or deleting branches
 #	  or tags since there's another event that handles those.
 #	- More readable output for '.github list'
 #	- Fixed the issue linker not linking to issues with really low numbers.
 #	- Fixed issue comment event so that it doesn't always say "commented" even
-#     if the action was edited or closed.
+#	  if the action was edited or closed.
 #	- Strip newlines from issue comments for more meaningful output.
 # 	- Fixed problem that caused commits not to show if the committer didn't
 #	  have an account on github.
@@ -122,20 +128,21 @@ namespace eval ::github {
 		source scripts/github.tcl.local
 		putlog "Loaded local settings from github.tcl.local"
 	}
-	
-	# ToDo: add support:
-	# deployment
-	# deployment_status
+
+	# Not supported:
 	# membership (organization hooks only)
-	# milestone
-	# page_build
-	# public
-	# pull_request_review
-	# repository
-	# team_add
+	# page_build (github pages crap - some website thing)
+	# public (seems kind of useless)
+	# repository (repositories being deleted and created etc)
+	# team_add (when a repository is added to a team)
+	#
+	# ToDo: add support:
+	# deployment (what is it and how is it different from status event?)
+	# deployment_status
+
 	
-	set validEvents [list commit_comment create delete fork gollum issue_comment issues label\
-					member pull_request pull_request_review_comment push release status watch]
+	set validEvents [list commit_comment create delete fork gollum issue_comment issues label member milestone \
+					pull_request pull_request_review_comment pull_request_review push release status watch]
 
 	variable state
 	variable settings
@@ -357,6 +364,7 @@ proc ::github::parseJson {event json} {
 			return $retval
 		}
 		issue_comment {
+			# this includes comments on pull requests
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
 			set bytes ""
 			switch -- [dict get $jdict action] {
@@ -381,7 +389,13 @@ proc ::github::parseJson {event json} {
 					set action [dict get $jdict action]
 				}
 			}
-			append msg "$action issue \#[dict get $jdict issue number]${bytes}: "
+			append msg "$action "
+			if {[dict exists $jdict issue pull_request]} {
+				append msg "pull request "
+			} else {
+				append msg "issue "
+			}
+			append msg "\#[dict get $jdict issue number]${bytes}: "
 			# strip newlines for more meaningful output
 			append msg "[shortenBody [join [regexp -all -inline {\S+} [dict get $jdict comment body]]]] "
 			append msg "[gitio [dict get $jdict issue html_url]]"
@@ -432,7 +446,7 @@ proc ::github::parseJson {event json} {
 			if {[string equal $action "edited"]} {
 				if {[dict exists $jdict changes name from]} {
 					# name was changed
-					set msg "\[${repName}\] $senderLogin renamed label \"[dict exists $jdict changes name from]\" to \"${labelName}\" $url"
+					set msg "\[${repName}\] $senderLogin renamed label \"[dict get $jdict changes name from]\" to \"${labelName}\" $url"
 				} elseif {[dict exists $jdict changes color from]} {
 					# color was changed
 					set msg "\[${repName}\] $senderLogin changed the color of label \"${labelName}\" $url"
@@ -451,6 +465,24 @@ proc ::github::parseJson {event json} {
 			append msg "[dict get $jdict action] member [dict get $jdict member login] "
 			append msg "to [dict get $jdict repository full_name]: "
 			append msg "[gitio [dict get $jdict repository html_url]]"
+			return [list $msg]
+		}
+		milestone {
+			# action - "created", "closed", "opened", "edited", or "deleted".
+			# milestone - The milestone itself.
+			# changes - The changes to the milestone if the action was "edited".
+			# changes[description][from] - The previous version of the description if the action was "edited".
+			# changes[due_on][from] - The previous version of the due date if the action was "edited".
+			# changes[title][from] - The previous version of the title if the action was "edited".
+			set action [dict get $jdict action]
+			set repName [dict get $jdict repository name]
+			set senderLogin [dict get $jdict sender login]
+			set milestoneUrl [gitio [dict get $jdict milestone html_url]]
+			set milestoneTitle [dict get $jdict milestone title]
+			#set milestoneDesc [dict get $jdict milestone description]
+			
+			set msg "\[${repName}\] $senderLogin $action milestone \"${milestoneTitle}\" $milestoneUrl"
+			
 			return [list $msg]
 		}
 		pull_request {
@@ -480,10 +512,28 @@ proc ::github::parseJson {event json} {
 			return [list $msg]
 		}
 		pull_request_review_comment {
+			# Triggered when a comment on a Pull Request's unified diff is created, edited, or deleted (in the Files Changed tab).
+			# this is a comment in the middle of the diff
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
 			append msg "commented on pull request #[dict get $jdict pull_request number]: "
 			append msg "[shortenBody [dict get $jdict comment body]] "
 			append msg "[gitio [dict get $jdict comment html_url]]"
+			return [list $msg]
+		}
+		pull_request_review {
+			# Triggered when a pull request review is submitted into a non-pending state.
+			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
+			append msg "[dict get $jdict action] a review for pull request #[dict get $jdict pull_request number]"
+			# review state can be commented, approved or changes_requested
+			if {[string equal [dict get $jdict review state] "approved"]} {
+				append msg " and approved it"
+			} elseif {[string equal [dict get $jdict review state] "changes_requested"]} {
+				append msg " and requested changes"
+			}
+			if {[dict exists $jdict review body]} {
+				append msg ": [shortenBody [dict get $jdict review body]]"
+			}
+			append msg " [gitio [dict get $jdict review html_url]]"
 			return [list $msg]
 		}
 		push {
@@ -1504,5 +1554,5 @@ namespace eval ::github {
 
 	loadSettings
 	
-	putlog "Loaded github.tcl v0.2 by Pixelz"
+	putlog "Loaded github.tcl v0.3 by Pixelz"
 }
