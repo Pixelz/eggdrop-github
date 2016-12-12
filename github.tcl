@@ -21,9 +21,15 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
-# v0.3 by Pixelz (rutgren@gmail.com), October 30, 2016
+# v0.4 by Pixelz (rutgren@gmail.com), December 12, 2016
 #
 # Changes:
+#
+# v0.4. December 12, 2016:
+#	- Use SNI in http requests to git.io and api.github.com.
+#	- Made URL shortening a lot more error-resistant.
+#	- Added more robustness around writing the settings file.
+#
 # v0.3. October 30, 2016:
 #	- Added support for pull_request_review event.
 #	- Added rudimentary support for milestone event.
@@ -56,7 +62,16 @@
 #	- Initial release.
 #
 # ToDo:
-#	- Write settings to temp file & move
+#	- Add support for libcurl
+#	- Make the http fetching not block (coroutines?)
+#	- Cache git.io urls
+#	- Rethink the whole output selection logic. I would like it to be more fine-tuned.
+#	- Make the dcc command more understandable
+#	- Add ability to set events to output the same way that chanset works
+#	- Change the way settings are stored so that the linker settings doesn't require special handling
+#	- Write help & documentation in general
+#	- Add msgcat support? might be difficult with the dynamic nature of some of the output
+#	- Restructure the parseJson proc & possibly other procs
 
 
 # some of these might be able to go lower, these are what the script was tested on
@@ -139,7 +154,6 @@ namespace eval ::github {
 	# ToDo: add support:
 	# deployment (what is it and how is it different from status event?)
 	# deployment_status
-
 	
 	set validEvents [list commit_comment create delete fork gollum issue_comment issues label member milestone \
 					pull_request pull_request_review_comment pull_request_review push release status watch]
@@ -155,16 +169,49 @@ proc ::github::ircstreql {string1 string2} {
 	string equal -nocase [string map [list \{ \[ \} \] ~ ^ | \\] $string1] [string map [list \{ \[ \} \] ~ ^ | \\] $string2]
 }
 
+# callback for tls::socket, outputs debug info
+proc ::github::tlsCommand {args} {
+	foreach arg $args {
+		foreach line [split $arg "\n"] {
+			putloglev 8 * "github.tcl tls state: $line"
+		}
+	}
+	return
+}
+
 proc ::github::gitio {url} {
 	variable shortenUrls
 	if {[info exists shortenUrls] && $shortenUrls != 1} { return $url }
+	::http::register https 443 [list ::tls::socket -command ::github::tlsCommand -request 0 -require 0 -servername "git.io"]
 
 	set url [regsub -- {^http://} $url {https://}]
-	set token [::http::geturl https://git.io -query [::http::formatQuery url $url]]
+	# this god forsaken thing can't be trusted not to spew errors everywhere
+	if {[catch { ::http::geturl https://git.io -query [::http::formatQuery url $url] } token]} {
+		putlog "github.tcl http error:"
+		foreach line [split $token "\n"] {
+			putlog "github.tcl http error: $line"
+		}
+		return $url
+	}
 	upvar #0 $token state
+	# "clean up" http::register for the benefit of legacy scripts
+	::http::register https 443 [list ::tls::socket]
+
+	if {[info exists state(error)]} { set error $state(error) }
 	array set meta $state(meta)
 	catch { ::http::cleanup $token }
-	if {[string equal "201 Created" $meta(Status)] && [string match "https://git.io/*" $meta(Location)] && [string length $meta(Location)] > 15} {
+	if {[info exists error]} {
+		putlog "github.tcl Error: git.io http error: $error"
+		return $url
+	} elseif {![info exists meta(Status)]} {
+		putlog "github.tcl Error: git.io http error, meta status does not exist, possibly ssl error?"
+		putlog "gibhub.tcl git.io meta: [array get meta]"
+		return $url
+	} elseif {![info exists meta(Location)]} {
+		putlog "github.tcl Error: git.io http error, meta location does not exist, possibly ssl error?"
+		putlog "github.tcl git.io meta: [array get meta]"
+		return $url
+	} elseif {[string equal "201 Created" $meta(Status)] && [string match "https://git.io/*" $meta(Location)] && [string length $meta(Location)] > 15} {
 		return $meta(Location)
 	} else {
 		putlog "github.tcl Error: git.io URL shortening failed."
@@ -214,6 +261,7 @@ proc ::github::issueLinker {nick uhost hand chan text} {
 		# https://api.github.com/repos/eggheads/eggdrop/issues/
 		# pull request: https://api.github.com/repos/eggheads/eggdrop/issues/156
 		# issue: https://api.github.com/repos/eggheads/eggdrop/issues/151
+		::http::register https 443 [list ::tls::socket -command ::github::tlsCommand -request 0 -require 0 -servername "api.github.com"]
 		set token [::http::geturl https://api.github.com/repos${repo}/issues/${id}]
 		upvar #0 $token state
 		
@@ -222,7 +270,10 @@ proc ::github::issueLinker {nick uhost hand chan text} {
 		array set meta $state(meta)
 		set body [encoding convertfrom utf-8 $state(body)]
 		catch { ::http::cleanup $token }
-		
+
+		# "clean up" http::register for the benefit of legacy scripts
+	        ::http::register https 443 [list ::tls::socket]	
+	
 		switch -exact -- $status {
 			reset {
 				putlog "github.tcl Error: issueLinker http error: connection reset"
@@ -513,7 +564,7 @@ proc ::github::parseJson {event json} {
 		}
 		pull_request_review_comment {
 			# Triggered when a comment on a Pull Request's unified diff is created, edited, or deleted (in the Files Changed tab).
-			# this is a comment in the middle of the diff
+			# um wat, there's no way to comment there? is this outdated now?
 			set msg "\[[dict get $jdict repository name]\] [dict get $jdict sender login] "
 			append msg "commented on pull request #[dict get $jdict pull_request number]: "
 			append msg "[shortenBody [dict get $jdict comment body]] "
@@ -1100,6 +1151,7 @@ proc ::github::httpResponse {sock} {
 	return
 }
 
+# called by bind time every minute
 proc ::github::timeout {args} {
 	variable state
 	
@@ -1152,26 +1204,75 @@ proc ::github::randomString {min {max -1} {chars "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd
 	return $randomString
 }
 
-proc ::github::settingsFileOk {} {
-	variable settingsFile
-	if {![file exists $settingsFile]} {
-		if {[catch {open $settingsFile w} fd]} {
-			putlog "github.tcl: Error: failed to create settings file: $fd"
-			# FixMe: make this unload the script or something?
-			return 0
+# check if we can read/write to a file
+# returns TCL_ERROR on error, TCL_OK on ok
+proc ::github::isFileOk {file} {
+	if {![file exists $file]} {
+		if {[catch {open $file w} fd]} {
+			return -code error "failed to create file \"${file}\""
 		} else {
 			chan close $fd
 		}
-	} elseif {[file isdirectory $settingsFile]} {
-		putlog "github.tcl Error: settings file is a directory."
+	} elseif {[file isdirectory $file]} {
+		return -code error "\"${file}\" is a directory."
+	} elseif {![file writable $file]} {
+		return -code error "file \"${file}\ is not writable."
+	} elseif {![file readable $file]} {
+		return -code error "file \"${file}\ is not readable."
+	}
+	return
+}
+
+# write safely to a file using a verified temp file that we rename
+# returns TCL_ERROR on error, TCL_OK on ok
+proc ::github::safeFileWrite {file data} {
+
+	set tempFile "${file}.tmp"
+
+	# do some sanity checks on the two files
+	if {[catch {isFileOk $file} error]} {
+		return -code error $error
+	} elseif {[catch {isFileOk $tempFile} error]} {
+		return -code error $error
+	}
+
+	# delete old temp file if it exists
+	if {[file exists $tempFile] && [catch {file delete -force -- $tempFile}]} {
+		return -code error "unable to save file \"${file}\": failed to delete old temp file:"
+	}
+
+	# write to temp file
+	if {[catch {open $tempFile w} fd]} {
+		putlog "github.tcl: Error: unable to save \"${file}\": failed to create temp file: $fd"
 		return 0
-	} elseif {![file writable $settingsFile]} {
-		putlog "github.tcl Error: settings file is not writable."
+	} else {
+		chan puts -nonewline $fd $data
+		chan close $fd
+	}
+
+	# verify temp file
+	if {[catch {open $tempFile r} fd]} {
+		putlog "github.tcl Error: unable to save \"${file}\": failed to open temp file: $fd"
+		if {[file exists $file]} {
+			file delete -force -- $file
+		}
 		return 0
-	} elseif {![file readable $settingsFile]} {
-		putlog "github.tcl Error: settings file is not readable."
+	} else {
+		set writtenTempData [chan read -nonewline $fd]
+		chan close $fd
+		if {![string equal $data $writtenTempData]} {
+			putlog "github.tcl Error: unable to save \"${file}\": written file data is corrupt"
+			return 0
+		}
+	}
+
+	# rename temp file to overwrite old file
+	if {[catch {file rename -force $tempFile $file} error} {
+		putlog "github.tcl Error: unable to save \"${file}\": failed to rename temp file: $error"
 		return 0
 	}
+
+	# everything is fine
 	return 1
 }
 
@@ -1179,16 +1280,11 @@ proc ::github::saveSettings {} {
 	variable settingsFile
 	variable settings
 	
-	if {[settingsFileOk]} {
-		if {[catch {open $settingsFile w} fd]} {
-			putlog "github.tcl Error: failed to open settings file: $fd"
-			# FixMe: make this unload the script or something?
-			return
-		} else {
-			chan puts $fd [dict get $settings]
-			chan close $fd
-		}
+	if {![safeFileWrite $settingsFile [dict get $settings]]} {
+		putlog "github.tcl Error: unable to save settings file."
+		# FixMe: make this unload the script or something?
 	}
+	
 	return
 }
 
@@ -1201,7 +1297,7 @@ proc ::github::loadSettings {} {
 			# FixMe: make this unload the script or something?
 			return
 		} else {
-			set data [read $fd]
+			set data [chan read $fd]
 			chan close $fd
 			if {[catch {dict keys $data}]} {
 				putlog "github.tcl Error: failed to parse settings file."
@@ -1543,8 +1639,6 @@ namespace eval ::github {
 		set initDone 1
 	}
 
-	::http::register https 443 [list ::tls::socket -require 0 -request 1]
-
 	# Make sure we're using UTF-8
 	encoding system utf-8
 	
@@ -1554,5 +1648,5 @@ namespace eval ::github {
 
 	loadSettings
 	
-	putlog "Loaded github.tcl v0.3 by Pixelz"
+	putlog "Loaded github.tcl v0.4 by Pixelz"
 }
