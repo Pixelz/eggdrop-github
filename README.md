@@ -18,7 +18,7 @@ The majority of the settings for this script are available via the `.github` com
 - [Eggdrop](http://www.eggheads.org/) 1.6.21 or above
 - [Tcl](http://www.tcl.tk/) 8.6 or above
 - [Tcllib](http://core.tcl.tk/tcllib)
-- [TLS](http://tcltls.rkeene.org/)
+- [TclTLS](http://core.tcl.tk/tcltls) 1.6.4 or above
 
 ## Installation
 - Put github.tcl in your Eggdrop `scripts/` directory
