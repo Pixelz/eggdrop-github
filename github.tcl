@@ -7,7 +7,7 @@
 #     The majority of the settings for this script are available via the
 #     ".github" command from the partyline.
 #
-# Copyright (c) 2016, Rickard Utgren <rutgren@gmail.com>
+# Copyright (c) 2016, 2020 Rickard Utgren <rutgren@gmail.com>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -21,9 +21,13 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
-# v0.4 by Pixelz (rutgren@gmail.com), December 12, 2016
+# v0.5 by Pixelz (rutgren@gmail.com), January 28, 2020
 #
 # Changes:
+#
+# v0.5. January 28, 2020:
+#	- Added caching for git.io URLs
+#	- Fixed an error with loading the settings file.
 #
 # v0.4. December 12, 2016:
 #	- Use SNI in http requests to git.io and api.github.com.
@@ -64,7 +68,6 @@
 # ToDo:
 #	- Add support for libcurl
 #	- Make the http fetching not block (coroutines?)
-#	- Cache git.io urls
 #	- Rethink the whole output selection logic. I would like it to be more fine-tuned.
 #	- Make the dcc command more understandable
 #	- Add ability to set events to output the same way that chanset works
@@ -132,6 +135,9 @@ namespace eval ::github {
 	# maximum length of headers in bytes
 	set headerLimit 5242880; # 5MB
 
+	# rough time in seconds until a git.io url expires from the cache (+ 0-10 minutes)
+	set gitioCacheTime 21600; # 6 hours
+	
 	# store JSON payload to a file, for reviewing later
 	set storeJson 0
 
@@ -161,6 +167,7 @@ namespace eval ::github {
 	variable state
 	variable settings
 	variable delayedSendIds
+	variable gitioCache
 }
 
 # rfc1459 channel name comparison
@@ -179,9 +186,54 @@ proc ::github::tlsCommand {args} {
 	return
 }
 
+# Expire cached URLs
+# called every 10 minutes by bind cron
+proc ::github::gitioCacheCleanup {args} {
+	variable gitioCache
+	variable gitioCacheTime
+	if {[info exists gitioCache]} {
+		foreach longUrl [dict keys $gitioCache] {
+			lassign [dict get $gitioCache $longUrl] shortUrl timeCreated
+			if {([clock seconds] - $timeCreated) > $gitioCacheTime} {
+				putloglev d * "github.tcl: URL expired from the cache: $longUrl -> $shortUrl"
+				dict unset gitioCache $longUrl
+			}
+		}
+	}
+	return
+}
+
+# Store a short URL in the cache
+proc ::github::gitioCacheStore {longUrl shortUrl} {
+	variable gitioCache
+	dict set gitioCache $longUrl $shortUrl [clock seconds]
+	putloglev d * "github.tcl: new URL added to cache $longUrl -> $shortUrl"
+	return
+}
+
+# Retrieve a short URL from the cache
+# returns the short url if it exists, "" if not.
+proc ::github::gitioCacheGet {longUrl} {
+	variable gitioCache
+	if {[info exists gitioCache] && [dict exists $gitioCache $longUrl]} {
+		lassign [dict get $gitioCache $longUrl] shortUrl timeCreated
+		putloglev d * "github.tcl: found cached URL: $longUrl -> $shortUrl"
+		return $shortUrl
+	} else {
+		putloglev d * "github.tcl: $longUrl is not cached"
+		return
+	}
+}
+
 proc ::github::gitio {url} {
 	variable shortenUrls
 	if {[info exists shortenUrls] && $shortenUrls != 1} { return $url }
+	
+	# check if we already have it cached
+	if {[set shortUrl [gitioCacheGet $url]] ne ""} {
+		return $shortUrl
+	}
+	
 	::http::register https 443 [list ::tls::socket -command ::github::tlsCommand -request 0 -require 0 -servername "git.io"]
 
 	set url [regsub -- {^http://} $url {https://}]
@@ -212,6 +264,7 @@ proc ::github::gitio {url} {
 		putlog "github.tcl git.io meta: [array get meta]"
 		return $url
 	} elseif {[string equal "201 Created" $meta(Status)] && [string match "https://git.io/*" $meta(Location)] && [string length $meta(Location)] > 15} {
+		gitioCacheStore $url $meta(Location)
 		return $meta(Location)
 	} else {
 		putlog "github.tcl Error: git.io URL shortening failed."
@@ -1291,7 +1344,10 @@ proc ::github::saveSettings {} {
 proc ::github::loadSettings {} {
 	variable settingsFile
 	variable settings
-	if {[settingsFileOk]} {
+	if {[catch {isFileOk $settingsFile} error]} {
+		putlog "github.tcl Error: $error"
+		return
+	} else {
 		if {[catch {open $settingsFile r} fd]} {
 			putlog "github.tcl Error: failed to open settings file: $fd"
 			# FixMe: make this unload the script or something?
@@ -1643,10 +1699,11 @@ namespace eval ::github {
 	encoding system utf-8
 	
 	bind time - "*" ::github::timeout
+	bind cron - "*/10" ::github::gitioCacheCleanup
 	bind dcc $dccFlags github ::github::dccCommand
 	bind pubm - "*" ::github::issueLinker
 
 	loadSettings
 	
-	putlog "Loaded github.tcl v0.4 by Pixelz"
+	putlog "Loaded github.tcl v0.5 by Pixelz"
 }
