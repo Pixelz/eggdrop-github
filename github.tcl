@@ -1320,7 +1320,7 @@ proc ::github::safeFileWrite {file data} {
 	}
 
 	# rename temp file to overwrite old file
-	if {[catch {file rename -force $tempFile $file} error} {
+	if {[catch {file rename -force $tempFile $file} error]} {
 		putlog "github.tcl Error: unable to save \"${file}\": failed to rename temp file: $error"
 		return 0
 	}
